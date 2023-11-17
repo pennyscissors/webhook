@@ -14,16 +14,20 @@ import (
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/trace"
 )
 
 const (
-	systemProjectLabel  = "authz.management.cattle.io/system-project"
-	projectQuotaField   = "resourceQuota"
-	clusterNameField    = "clusterName"
-	namespaceQuotaField = "namespaceDefaultResourceQuota"
+	systemProjectLabel          = "authz.management.cattle.io/system-project"
+	projectQuotaField           = "resourceQuota"
+	projectContDefResLimitField = "containerDefaultResourceLimit"
+	requestsCpuField            = "requestsCpu"
+	requestsMemoryField         = "requestsMemory"
+	clusterNameField            = "clusterName"
+	namespaceQuotaField         = "namespaceDefaultResourceQuota"
 )
 
 var projectSpecFieldPath = field.NewPath("project").Child("spec")
@@ -123,19 +127,21 @@ func (a *admitter) admitUpdate(oldProject, newProject *v3.Project) (*admissionv1
 func (a *admitter) admitCommonCreateUpdate(oldProject, newProject *v3.Project) (*admissionv1.AdmissionResponse, error) {
 	projectQuota := newProject.Spec.ResourceQuota
 	nsQuota := newProject.Spec.NamespaceDefaultResourceQuota
-	if projectQuota == nil && nsQuota == nil {
+	projectContDefResLimit := newProject.Spec.ContainerDefaultResourceLimit
+	if projectQuota == nil && nsQuota == nil && projectContDefResLimit == nil {
 		return admission.ResponseAllowed(), nil
 	}
 	fieldErr, err := checkQuotaFields(projectQuota, nsQuota)
 	if err != nil {
 		return nil, fmt.Errorf("error checking project quota fields: %w", err)
 	}
-	if fieldErr != nil {
-		return admission.ResponseBadRequest(fieldErr.Error()), nil
-	}
 	fieldErr, err = a.checkQuotaValues(&nsQuota.Limit, &projectQuota.Limit, oldProject)
 	if err != nil {
 		return nil, fmt.Errorf("error checking quota values: %w", err)
+	}
+	fieldErr, err = a.checkContResLimitValues(projectContDefResLimit)
+	if err != nil {
+		return nil, fmt.Errorf("error checking container default resource limit values: %w", err)
 	}
 	if fieldErr != nil {
 		return admission.ResponseBadRequest(fieldErr.Error()), nil
@@ -205,6 +211,38 @@ func (a *admitter) checkQuotaValues(nsQuota, projectQuota *v3.ResourceQuotaLimit
 
 	// check quota relative to used quota
 	return usedQuotaFits(&oldProject.Spec.ResourceQuota.UsedLimit, projectQuota)
+}
+
+func (a *admitter) checkContResLimitValues(contResLimits *v3.ContainerResourceLimit) (*field.Error, error) {
+	if contResLimits.RequestsCPU != "" && contResLimits.LimitsCPU != "" {
+		cpuRequest, err := resource.ParseQuantity(contResLimits.RequestsCPU)
+		if err != nil {
+			return nil, err
+		}
+		cpuLimit, err := resource.ParseQuantity(contResLimits.LimitsCPU)
+		if err != nil {
+			return nil, err
+		}
+		// return field error if CPU requested is greater than CPU limit
+		if cpuRequest.Cmp(cpuLimit) > 0 {
+			return field.Forbidden(projectSpecFieldPath.Child(projectContDefResLimitField, requestsCpuField), fmt.Sprintf("CPU reserve requested %v exceeds CPU limit %v", contResLimits.RequestsCPU, contResLimits.LimitsCPU)), nil
+		}
+	}
+	if contResLimits.RequestsMemory != "" && contResLimits.LimitsMemory != "" {
+		memoryRequest, err := resource.ParseQuantity(contResLimits.RequestsMemory)
+		if err != nil {
+			return nil, err
+		}
+		memoryLimit, err := resource.ParseQuantity(contResLimits.LimitsMemory)
+		if err != nil {
+			return nil, err
+		}
+		// return field error if memory requested is greater than memory limit
+		if memoryRequest.Cmp(memoryLimit) > 0 {
+			return field.Forbidden(projectSpecFieldPath.Child(projectContDefResLimitField, requestsMemoryField), fmt.Sprintf("memory reserve requested %v exceeds memory limit %v", contResLimits.RequestsMemory, contResLimits.LimitsMemory)), nil
+		}
+	}
+	return nil, nil
 }
 
 func namespaceQuotaFits(namespaceQuota, projectQuota *v3.ResourceQuotaLimit) (*field.Error, error) {
